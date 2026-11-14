@@ -62,6 +62,12 @@
     <span class="phase">Volume</span><input type="range" id="vol" min="0" max="100" value="80">
     <label class="phase"><input type="checkbox" id="loop"> loop</label>
   </div>
+  <div class="bar">
+    <span class="phase">Pitch up</span>
+    <input type="range" id="mult" min="1" max="10" step="1" value="1" aria-label="Frequency multiplier">
+    <span id="multLabel" class="clock" style="min-width:0;font-size:15px">1×</span>
+    <span class="phase" id="multBand">original pitch</span>
+  </div>
   <div class="phase warn" id="modeNote"></div>
 
   <div class="row2">
@@ -74,6 +80,7 @@
     <b>What you're hearing.</b> The strip isn't an audio recording. Each line is a galvanometer trace from a Tucker hot-wire microphone, whose output was rectified (always one-sided), so it shows <i>when</i> and <i>how hard</i> pressure pulses arrived, not a sound wave. These sounds are built from those traced pulses.
     <b>Audible</b> fills each pulse with 25–180 Hz rumble so it carries on ordinary speakers.
     <b>Strictly accurate</b> keeps everything inside the microphones' response (resonance about 30–50 Hz, guns measured at 10–25 Hz) and needs headphones or a subwoofer. The meters show activity either way.
+    <b>Pitch up</b> multiplies every frequency by a whole number (2×, 3×…) so small speakers that can't play deep bass can still carry the sound. Timing and loudness of each pulse are unchanged; only the pitch moves. 1× is the original.
     The soft chime marks where the strip was cut (about two minutes removed). Time scale: tick marks on the top line, 0.5 s apart. Mic 6 has faded out of the print after the cut, so it is silent there.
     <br>Source: frontispiece, <i>America's Munitions 1917–1918</i>, report of Benedict Crowell, Government Printing Office, 1919.
   </div>
@@ -126,6 +133,8 @@ function fmt(s){ const h=Math.floor(s/3600), m=Math.floor(s%3600/60), ss=(s%60);
 const enabled = [true,true,true,true,true,true];
 let mode = "audible", playing = false, startCtx = 0, offset = 0;
 let ctx = null, master, comp, buses = {}, buffers = {}, sources = [];
+let mult = 1; const shifted = {};   // shifted[N] = {audible:[AudioBuffer…], accurate:[…]}
+const BANDS = {audible:[25,180], accurate:[10,50]};
 
 /* ---------- mic cards ---------- */
 const micsEl = document.getElementById("mics"), meterEls = [], noteEls = [], cardEls = [];
@@ -182,7 +191,8 @@ function stopSources(){ sources.forEach(s=>{ try{s.stop();}catch(e){} }); source
 function startAt(off){
   stopSources();
   // all 12 tracks run in lock-step; switching sets or mics only moves gains, so nothing drifts
-  for (const m of ["audible","accurate"]) buffers[m].forEach((b,i)=>{
+  const set = mult===1 ? buffers : shifted[mult];
+  for (const m of ["audible","accurate"]) set[m].forEach((b,i)=>{
     const s = ctx.createBufferSource(); s.buffer = b; s.connect(buses[m][i]); s.start(ctx.currentTime+0.03, off); sources.push(s);
   });
   startCtx = ctx.currentTime + 0.03 - off;
@@ -190,7 +200,7 @@ function startAt(off){
 function now(){ return playing ? Math.min(L.total, ctx.currentTime - startCtx) : offset; }
 async function play(){
   const p = initAudio(); if (ctx.state !== "running") ctx.resume();
-  playBtn.textContent = "Loading…"; await p;
+  playBtn.textContent = "Loading…"; await p; await ensureShifted(mult);
   if (offset >= L.total - 0.01) offset = 0; startAt(offset); playing = true; playBtn.textContent = "❚❚ Pause"; }
 function pause(){ offset = now(); stopSources(); playing = false; playBtn.textContent = "▶ Play"; }
 function seek(t){ offset = Math.max(0, Math.min(L.total, t)); if (playing) startAt(offset); }
@@ -202,14 +212,76 @@ document.getElementById("vol").oninput = () => applyGains();
 document.querySelectorAll("#mode button").forEach(b => b.onclick = () => {
   mode = b.dataset.m; document.querySelectorAll("#mode button").forEach(x=>x.classList.toggle("on", x===b));
   document.getElementById("modeNote").textContent = mode==="accurate"
-    ? "Strictly accurate: 10–50 Hz only. Most phone and laptop speakers can't reproduce this — use headphones or a subwoofer; the meters still show the activity." : "";
-  applyGains();
+    ? "Strictly accurate: 10–50 Hz at 1×. Most phone and laptop speakers can't reproduce this — use headphones, a subwoofer, or raise Pitch up; the meters still show the activity." : "";
+  applyGains(); multText();
 });
 const scrub = document.getElementById("scrub");
 scrub.oninput = () => seek(scrub.value/1000*L.total);
 document.getElementById("stage").addEventListener("click", e => {
   const r = cv.getBoundingClientRect(); seek(tAtX((e.clientX-r.left)/r.width*D.w));
 });
+
+/* ---------- whole-number pitch up ----------
+   Analytic signal z = a·e^{iφ}. Output = a·cos(Nφ): every instantaneous frequency is
+   multiplied by N while the envelope a (pulse timing and strength) is untouched.
+   N must be a whole number, otherwise e^{iNφ} has no single value as φ wraps around. */
+function fft(re, im, inv){
+  const n = re.length;
+  for (let i=1, j=0; i<n; i++){ let b = n>>1; for (; j&b; b>>=1) j ^= b; j ^= b;
+    if (i<j){ let t=re[i]; re[i]=re[j]; re[j]=t; t=im[i]; im[i]=im[j]; im[j]=t; } }
+  for (let len=2; len<=n; len<<=1){
+    const ang = (inv?2:-2)*Math.PI/len, wr = Math.cos(ang), wi = Math.sin(ang), h = len>>1;
+    for (let i=0; i<n; i+=len){ let cr=1, ci=0;
+      for (let k=0; k<h; k++){
+        const a=i+k, b=a+h, xr=re[b]*cr-im[b]*ci, xi=re[b]*ci+im[b]*cr;
+        re[b]=re[a]-xr; im[b]=im[a]-xi; re[a]+=xr; im[a]+=xi;
+        const t=cr*wr-ci*wi; ci=cr*wi+ci*wr; cr=t; } } }
+  if (inv) for (let i=0;i<n;i++){ re[i]/=n; im[i]/=n; }
+}
+function multiplyFreq(buf, N){
+  const x = buf.getChannelData(0), len = x.length, sr = buf.sampleRate;
+  let n = 1; while (n < len) n <<= 1;
+  const re = new Float64Array(n), im = new Float64Array(n);
+  let mean = 0; for (let i=0;i<len;i++) mean += x[i]; mean /= len;
+  for (let i=0;i<len;i++) re[i] = x[i]-mean;
+  fft(re, im, false);                                   // keep positive frequencies only → analytic signal
+  for (let k=1; k<n/2; k++){ re[k]*=2; im[k]*=2; }
+  for (let k=n/2+1; k<n; k++){ re[k]=0; im[k]=0; }
+  fft(re, im, true);
+  const out = ctx.createBuffer(1, len, sr), y = out.getChannelData(0);
+  for (let i=0;i<len;i++) y[i] = Math.hypot(re[i],im[i]) * Math.cos(N*Math.atan2(im[i],re[i]));
+  // keep the cut chime at its own pitch: splice the original back in across the silent pads
+  const a = Math.floor((L.before+L.chime_start)/2*sr), b = Math.min(len, Math.ceil((L.chime_end+L.after_start)/2*sr));
+  for (let i=a;i<b;i++) y[i] = x[i];
+  return out;
+}
+async function ensureShifted(N){
+  if (N===1 || shifted[N]) return;
+  const set = {};
+  for (const m of ["audible","accurate"]){
+    set[m] = [];
+    for (const b of buffers[m]){ set[m].push(multiplyFreq(b, N)); await new Promise(r=>setTimeout(r,0)); }
+  }
+  shifted[N] = set;
+}
+const multEl = document.getElementById("mult");
+function multText(){
+  const N = +multEl.value, [lo,hi] = BANDS[mode];
+  document.getElementById("multLabel").textContent = N + "×";
+  document.getElementById("multBand").textContent = N===1 ? "original pitch" : `now about ${lo*N}–${hi*N} Hz`;
+}
+let multJob = 0;
+multEl.oninput = multText;
+multEl.onchange = async () => {
+  const N = Math.max(1, Math.round(+multEl.value)); multEl.value = N; multText();
+  const job = ++multJob;
+  if (!buffers.audible){ mult = N; return; }           // audio not loaded yet; applied when Play is pressed
+  if (N!==1 && !shifted[N]) document.getElementById("multBand").textContent = "processing…";
+  await ensureShifted(N);
+  if (job !== multJob) return;                          // a newer choice superseded this one
+  mult = N; multText();
+  if (playing) startAt(now());
+};
 
 /* ---------- drawing ---------- */
 function draw(){
